@@ -24,8 +24,10 @@ decisions with manual execution.
   external signal generator (e.g. TradingView) is required or assumed.
 - **Multi-asset from day one.** Architecture handles stocks, crypto, ETFs, REITs, and
   commodities uniformly.
-- **All data sources.** Price/volume, news sentiment, social media signals, macroeconomic
-  events, and prediction markets are all first-class inputs.
+- **Data sources are layered in incrementally.** TA and price data come first. News,
+  social, options flow, and prediction markets are added one at a time after the TA core
+  has validated edge on real historical data. More data sources before a validated core
+  adds noise, not signal.
 - **Risk first.** Every accepted signal passes through the risk engine. Position sizing,
   exposure caps, and regime filters are not optional.
 - **Paper mode from the first Telegram milestone.** Never debug with real money.
@@ -38,6 +40,13 @@ decisions with manual execution.
 - **Validate early, build late.** Run a simplified backtest on the TA engine before
   building the full scanner and Telegram infrastructure. Months of engineering on an
   unvalidated strategy is the most common way to waste time.
+- **Know your broker's constraints.** Short selling, instrument availability, execution
+  model (spread-based vs. commission), and fractional share support vary by broker. The
+  bot is parameterised for these via `ALLOW_SHORT_SIGNALS`, `FRACTIONAL_SHARES`, and
+  per-asset-class configuration. **Default settings target Trade Republic: no short
+  selling, spread-based execution, fractional shares supported.** All P&L shown is gross
+  (pre-tax); German residents should note that Kapitalertragsteuer (~26.375%) is withheld
+  automatically by TR — the bot's reported returns are pre-tax gross figures.
 - **Security baked in everywhere.** Rate limiting, secrets management, input validation,
   and audit logging are part of every milestone, not an afterthought.
 - **Production quality from commit one.** Structured logging, tests, CI, graceful
@@ -303,6 +312,7 @@ Build order: M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10
   - [ ] `serde`, `serde_json`
   - [ ] `uuid` (features: v4, serde)
   - [ ] `chrono` (features: serde)
+  - [ ] `chrono-tz` — required for VWAP session-reset timezone handling (`Tz` type)
   - [ ] `rust_decimal` (features: serde-with-str)
   - [ ] `anyhow`, `thiserror`
   - [ ] `tracing`, `tracing-subscriber` (features: env-filter, json)
@@ -362,6 +372,7 @@ CREATE TABLE watchlist (
     symbol      TEXT NOT NULL UNIQUE,
     asset_class TEXT NOT NULL CHECK (asset_class IN (
                     'stock','etf','crypto','reit','commodity','index')),
+    sector      TEXT,            -- GICS sector; populated by M6.5 migration, used by M7 risk engine
     enabled     BOOLEAN NOT NULL DEFAULT true,
     note        TEXT,
     added_at    TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -448,47 +459,9 @@ CREATE TABLE audit_log (
 );
 CREATE INDEX audit_log_at_idx ON audit_log (at DESC);
 
--- Backtest results (one row per run; trade-level detail in backtest_trades)
-CREATE TABLE backtest_runs (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    strategy            TEXT NOT NULL,
-    symbols             TEXT[] NOT NULL,
-    timeframe           TEXT NOT NULL,
-    train_from          TIMESTAMPTZ NOT NULL,
-    train_to            TIMESTAMPTZ NOT NULL,
-    oos_from            TIMESTAMPTZ NOT NULL,   -- out-of-sample window start
-    oos_to              TIMESTAMPTZ NOT NULL,
-    fee_per_trade       NUMERIC NOT NULL,
-    slippage_bps        NUMERIC NOT NULL,
-    trade_count         INTEGER NOT NULL,
-    win_rate            NUMERIC NOT NULL,
-    avg_r               NUMERIC NOT NULL,
-    expectancy          NUMERIC NOT NULL,
-    profit_factor       NUMERIC NOT NULL,
-    max_drawdown_pct    NUMERIC NOT NULL,
-    sharpe_ratio        NUMERIC NOT NULL,
-    win_rate_p_value    NUMERIC NOT NULL,       -- binomial test vs 50%
-    monte_carlo_p05_dd  NUMERIC NOT NULL,       -- 5th-percentile max drawdown
-    passed_gate         BOOLEAN NOT NULL,       -- true if all thresholds met
-    regime_breakdown    JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE backtest_trades (
-    id              BIGSERIAL PRIMARY KEY,
-    run_id          UUID NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
-    symbol          TEXT NOT NULL,
-    side            TEXT NOT NULL,
-    entry_at        TIMESTAMPTZ NOT NULL,
-    exit_at         TIMESTAMPTZ NOT NULL,
-    entry_price     NUMERIC NOT NULL,
-    exit_price      NUMERIC NOT NULL,
-    stop_loss       NUMERIC NOT NULL,
-    take_profit     NUMERIC NOT NULL,
-    r_multiple      NUMERIC NOT NULL,   -- actual outcome in R units
-    exit_reason     TEXT NOT NULL       -- 'target','stop','end_of_data'
-);
-CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
+-- backtest_runs and backtest_trades are introduced as a separate migration in M6.5,
+-- once the backtesting engine is designed. Defining them here would couple M2 to
+-- M6.5 implementation details before M5 is even built.
 ```
 
 ### Testing
@@ -523,9 +496,21 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
       async fn latest_price(&self, symbol: &str) -> anyhow::Result<Decimal>;
   }
   ```
+- [ ] **`calendar/mod.rs` — exchange calendar (pure functions, no I/O):**
+  - [ ] `ExchangeCalendar::is_trading_day(date, asset_class)` → `bool` — returns false
+    on weekends and exchange holidays (NYSE for stocks/ETFs, always-true for crypto)
+  - [ ] `ExchangeCalendar::session_open(date, asset_class)` → `Option<DateTime<Utc>>`
+  - [ ] `ExchangeCalendar::session_close(date, asset_class)` → `Option<DateTime<Utc>>`
+  - [ ] Holiday list: maintain a static table of NYSE holidays (New Year's, MLK Day,
+    Presidents' Day, Good Friday, Memorial Day, Juneteenth, Independence Day, Labor Day,
+    Thanksgiving, Christmas) for the next 3 years; updated annually
+  - [ ] This module is used by both M4 (gap detection) and M6 (scan scheduling)
 - [ ] Implement `PolygonProvider` (primary for stocks/ETFs):
   - [ ] REST client using `reqwest`
-  - [ ] Aggregate candles endpoint (`/v2/aggs/ticker/{ticker}/range/...`)
+  - [ ] Aggregate candles endpoint: **always pass `adjusted=true`** — without this,
+    historical prices for any split stock (TSLA, NVDA, AMZN etc.) are wrong, silently
+    corrupting all indicator calculations and backtests
+  - [ ] URL: `/v2/aggs/ticker/{ticker}/range/{mult}/{span}/{from}/{to}?adjusted=true&sort=asc`
   - [ ] Latest price via last trade / prev close endpoint
   - [ ] Timeframe mapping: `'1d'` → `day/1`, `'4h'` → `hour/4`, etc.
   - [ ] Parse `NUMERIC` prices — never cast to `f64`
@@ -535,6 +520,8 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
 - [ ] Implement `CoinGeckoProvider` (crypto supplement):
   - [ ] Map `BTC-USD` → CoinGecko id `bitcoin`
   - [ ] Fetch OHLCV via `/coins/{id}/ohlc`
+  - [ ] **Crypto OHLCV is unadjusted by convention** — no stock-style splits for major
+    coins; token rebases (AMPL, stETH) are exotic and excluded from the default watchlist
   - [ ] Same retry and timeout discipline
 - [ ] `MockProvider` for tests: returns configurable fixed candle sequences
 - [ ] In-memory LRU cache keyed by `(symbol, timeframe)` storing the latest N candles
@@ -552,6 +539,9 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
 - [ ] Cache: second call within TTL makes zero HTTP requests
 - [ ] Symbol routing: crypto goes to `CoinGeckoProvider`, stocks to `PolygonProvider`
 - [ ] `/ready` returns 503 when Polygon is unreachable
+- [ ] Polygon URL contains `adjusted=true` — verified by inspecting the captured request URL in tests
+- [ ] `ExchangeCalendar::is_trading_day`: NYSE holiday returns false; adjacent Saturday/Sunday returns false; regular weekday returns true
+- [ ] `ExchangeCalendar::session_open` / `session_close`: crypto returns `None` (always open); stock returns correct ET window
 
 ---
 
@@ -567,7 +557,11 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
   - [ ] For each symbol × timeframe: fetch candles from `last stored ts` to `now()`
   - [ ] Upsert into `candles` table (rely on UNIQUE constraint)
   - [ ] Emit `tracing::info!` for new candles stored; `tracing::warn!` for gaps
-- [ ] Gap detection: after ingest, check for unexpected gaps in the series; log them
+- [ ] **Gap detection using `ExchangeCalendar`:** after ingest, check for unexpected
+  gaps by iterating expected trading days (from calendar) and verifying a candle exists
+  for each. Weekends and NYSE holidays are expected absences — do not log them as gaps.
+  Only flag gaps on days the exchange was open. This prevents false-positive warnings
+  on every holiday and weekend.
 - [ ] Respect provider rate limits: configurable concurrency limit per provider
 - [ ] Graceful shutdown: ingestor task listens on the shared shutdown channel
 - [ ] **Self-monitoring / dead-man heartbeat:**
@@ -581,6 +575,14 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
     any heartbeat is stale (so an external uptime monitor can also catch it)
 - [ ] Telegram command `GET /watchlist` list (later wired in M8); data model ready now
 - [ ] Watchlist seeding from `WATCHLIST_SEED` env var (CSV of symbols) on first boot
+- [ ] **Watchlist quality validation** — run on every `/add` and at seed time; reject
+  symbols that fail any of:
+  - Price < `MIN_SYMBOL_PRICE` (env, default $1.00) — rejects penny stocks
+  - 20-day ADV (from most recent candles or provider quote) < `MIN_ADV_USD`
+    (env, default $1,000,000) — rejects illiquid names where fills are unrealistic
+  - Symbol not found on the configured provider — catches typos immediately
+  - Log rejection reason via `tracing::warn!`; return a clear error to the user
+    when triggered via `/add`
 
 ### Testing
 
@@ -589,7 +591,11 @@ CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
 - [ ] Upsert on conflict does not corrupt existing rows
 - [ ] Rate-limit concurrency cap is respected (mock provider counts parallel calls)
 - [ ] Shutdown signal causes ingestor to finish current batch and exit cleanly
-- [ ] Gap in provider data is logged as a warning, does not crash task
+- [ ] Gap in provider data (on a trading day) is logged as a warning, does not crash task
+- [ ] Holiday gap (NYSE closed) is NOT logged as a gap warning
+- [ ] Weekend absence is NOT logged as a gap warning
+- [ ] Watchlist validation: symbol below `MIN_ADV_USD` is rejected with reason
+- [ ] Watchlist validation: symbol below `MIN_SYMBOL_PRICE` is rejected with reason
 - [ ] Watchdog: if ingestor heartbeat goes stale (mock time advance), Telegram alert fires
 - [ ] `GET /health` returns 503 when ingestor heartbeat is stale
 
@@ -687,8 +693,13 @@ before adding Telegram, risk engine, and deployment infrastructure on top of the
 
 ### Todos
 
+- [ ] **Data tier constraint:** this backtest runs on **daily candles only**. Polygon's
+  free tier provides end-of-day data; intraday (4H, 1H, 15M, 5M) requires a paid tier.
+  Do not attempt to validate intraday strategies here — validate the daily setup logic
+  first. If daily logic shows edge, upgrade to the Starter tier (~$29/month) before
+  implementing intraday entry confirmation in M6.
 - [ ] `QuickBacktester::run(symbols, candles_by_symbol, config)`:
-  - Walk forward bar-by-bar on 3 years of daily candles — no look-ahead
+  - Walk forward bar-by-bar on 3 years of **daily** candles — no look-ahead
   - Apply `EmaPullbackStrategy` and `BreakoutStrategy` signal logic directly over M5 TA functions
   - Entry at bar N+1 open + configured slippage; check intra-bar stop/target on each subsequent bar
   - Apply flat €1 fee per trade
@@ -727,6 +738,30 @@ before adding Telegram, risk engine, and deployment infrastructure on top of the
 - [ ] Scanner updates its `last_heartbeat_at` in `AppState` after every full scan cycle
   (feeds the watchdog introduced in M4)
 - [ ] Configurable scan interval per timeframe (env: `SCAN_INTERVAL_1D_SECS`, etc.)
+- [ ] **`ALLOW_SHORT_SIGNALS` env var (default `false`):** when false, the scanner
+  skips all short-side signal generation and short strategy paths entirely. Set true
+  only if your broker supports short selling. Trade Republic does not.
+- [ ] **Market hours gate:** before running any scan cycle for equity symbols, check
+  `ExchangeCalendar::is_trading_day(today, asset_class)`. If the exchange is closed
+  (holiday or weekend), skip the scan for that asset class and log at debug level.
+  Crypto scans run 24/7 regardless.
+- [ ] **Time-of-day blackout for equity signal delivery:**
+  - [ ] `SCAN_BLACKOUT_OPEN_MINS` (env, default `30`): suppress Telegram sends for
+    equity signals fired within N minutes of session open (09:30–10:00 ET). Wide spreads
+    and algo activity in this window make fills materially worse.
+  - [ ] `SCAN_BLACKOUT_CLOSE_MINS` (env, default `30`): same for last N minutes before
+    close (15:30–16:00 ET).
+  - [ ] Signals generated during a blackout window are stored with `status='pending'`
+    as normal; notification is simply deferred until the blackout ends.
+  - [ ] Crypto is 24/7 — blackout does not apply.
+- [ ] **Minimum liquidity (ADV) gate:**
+  - [ ] Before generating a signal for a symbol, compute its 20-day ADV from stored candles
+  - [ ] Reject signal if ADV < `MIN_ADV_USD` (env, default `1_000_000`) — stock too
+    illiquid for realistic fills
+  - [ ] Reject signal if calculated position value (from risk engine preview) >
+    `ADV_POSITION_MAX_PCT` (env, default `0.5`) % of ADV — position too large to fill
+    cleanly
+  - [ ] Rejection is silent (no Telegram message); logged as `tracing::debug!`
 - [ ] For each enabled symbol in watchlist, on each scan tick:
   1. Load candles for configured timeframes from DB (no re-fetch — candle store is source of truth)
   2. Run `analyse()` for each timeframe
@@ -804,6 +839,12 @@ before adding Telegram, risk engine, and deployment infrastructure on top of the
   in `SignalContext`
 - [ ] Earnings within 3–5 days: score reduced by 5, warning present
 - [ ] No earnings data for symbol: strategies run without error (earnings modifier skipped)
+- [ ] `ALLOW_SHORT_SIGNALS=false`: qualifying short setup generates no signal; long setup still works
+- [ ] NYSE holiday: equity scan skipped, no signals generated, debug log emitted
+- [ ] Signal fired during open blackout window: stored as `pending`, Telegram not sent until window ends
+- [ ] Signal fired outside blackout: delivered immediately
+- [ ] ADV below `MIN_ADV_USD`: signal not generated, debug log emitted
+- [ ] Position value > `ADV_POSITION_MAX_PCT`% of ADV: signal not generated
 
 ---
 
@@ -822,17 +863,63 @@ milestone is built on a strategy that has already proven its edge on real histor
 
 ### How to get 1000 trades without waiting a year
 
-Polygon.io provides up to 3 years of intraday OHLCV history on its free tier. M4 already
-back-fills this on startup. With 3 years of candles across a 30-symbol watchlist and
-multiple timeframes, a strategy firing on 2–3% of bars yields well over 1000 simulated
+M4 back-fills up to 3 years of daily candles on startup. **The M6.5 backtest runs on
+daily candles only — the Polygon free tier is sufficient for this.** (Intraday candles
+require a paid Polygon tier, as noted in Data Sources; those are needed for live scanning
+in M6 but not for the daily-candle backtest gate.) With 3 years of daily candles across
+a 30-symbol watchlist, a strategy firing on 2–3% of bars yields well over 1000 simulated
 trades immediately — no waiting required.
 
 ### Todos
 
 #### Data preparation
 - [ ] Verify M4 back-fill covers at least 3 years for all watchlist symbols
-- [ ] Add `sector` and `market` columns to `watchlist` table (needed for regime-split
-  reporting and correlation checks)
+- [ ] New migration (M6.5a): create `backtest_runs` and `backtest_trades` tables:
+  ```sql
+  CREATE TABLE backtest_runs (
+      id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      strategy            TEXT NOT NULL,
+      symbols             TEXT[] NOT NULL,
+      timeframe           TEXT NOT NULL,
+      train_from          TIMESTAMPTZ NOT NULL,
+      train_to            TIMESTAMPTZ NOT NULL,
+      oos_from            TIMESTAMPTZ NOT NULL,
+      oos_to              TIMESTAMPTZ NOT NULL,
+      fee_per_trade       NUMERIC NOT NULL,
+      slippage_bps        NUMERIC NOT NULL,
+      trade_count         INTEGER NOT NULL,
+      win_rate            NUMERIC NOT NULL,
+      avg_r               NUMERIC NOT NULL,
+      expectancy          NUMERIC NOT NULL,
+      profit_factor       NUMERIC NOT NULL,
+      max_drawdown_pct    NUMERIC NOT NULL,
+      sharpe_ratio        NUMERIC NOT NULL,
+      win_rate_p_value    NUMERIC NOT NULL,
+      monte_carlo_p05_dd  NUMERIC NOT NULL,
+      passed_gate         BOOLEAN NOT NULL,
+      regime_breakdown    JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE TABLE backtest_trades (
+      id              BIGSERIAL PRIMARY KEY,
+      run_id          UUID NOT NULL REFERENCES backtest_runs(id) ON DELETE CASCADE,
+      symbol          TEXT NOT NULL,
+      side            TEXT NOT NULL,
+      entry_at        TIMESTAMPTZ NOT NULL,
+      exit_at         TIMESTAMPTZ NOT NULL,
+      entry_price     NUMERIC NOT NULL,
+      exit_price      NUMERIC NOT NULL,
+      stop_loss       NUMERIC NOT NULL,
+      take_profit     NUMERIC NOT NULL,
+      r_multiple      NUMERIC NOT NULL,
+      exit_reason     TEXT NOT NULL
+  );
+  CREATE INDEX backtest_trades_run_idx ON backtest_trades (run_id);
+  ```
+- [ ] New migration (M6.5b): `ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS sector TEXT`
+  (the column already exists as nullable from M2; this migration is a no-op if M2 ran
+  first, but makes the dependency explicit). Add `market TEXT` column for regime-split
+  reporting: `ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS market TEXT`
 - [ ] Index symbols for broad market proxies: SPY, QQQ, IWM added to watchlist
   automatically as regime anchors (non-tradeable, `enabled=false` for scanning)
 
@@ -985,6 +1072,9 @@ trades immediately — no waiting required.
   - [ ] `MAX_OPEN_TRADES` (e.g. `5`)
   - [ ] `MAX_TOTAL_OPEN_RISK_PCT` (e.g. `5.0`)
   - [ ] `FRACTIONAL_SHARES` (bool — Trade Republic supports fractional for many assets)
+  - [ ] `ALLOW_SHORT_SIGNALS` (bool, default `false` — Trade Republic does not support
+    short selling; risk engine rejects short-side trades when false regardless of how
+    the signal was generated)
 - [ ] Position sizing:
   - [ ] `quantity = (account_size × risk_pct / 100) / |entry_price − stop_loss|`
   - [ ] Round to 2 decimal places if `FRACTIONAL_SHARES=true`, else floor to integer
@@ -1200,6 +1290,29 @@ trades immediately — no waiting required.
   4. **Paper mode:** immediately set `status='open'`, `actual_entry_price=planned_entry_price`,
      `opened_at=now()`; send confirmation; skip execution buttons
   5. **Live mode:** send follow-up with `executed:<trade_id>` / `cancel_trade:<trade_id>` buttons
+- [ ] **Partial profit management — scale-out at 1R:**
+  - [ ] New migration (M9): add nullable columns to `trades`:
+    `scale_out_price NUMERIC`, `scale_out_qty NUMERIC`, `scale_out_at TIMESTAMPTZ`,
+    `scale_out_elected BOOLEAN NOT NULL DEFAULT false`
+  - [ ] `SCALE_OUT_ENABLED` env var (default `true`); `SCALE_OUT_AT_R` (default `1.0`)
+  - [ ] When price reaches `actual_entry_price + 1R` (detected by trade monitor in
+    V2-09), a Telegram message is sent:
+    ```
+    📊 AAPL Long +1R reached
+    Entry 184.20 → Now ~193.40 (+9.20 = +1.0R)
+    Scale out half and move stop to breakeven?
+    ```
+    with buttons `scale_out_half:<trade_id>` / `hold_full:<trade_id>`
+  - [ ] `scale_out_half` callback:
+    1. Close 50% of `quantity` at current market price (user enters actual fill)
+    2. Store `scale_out_price`, `scale_out_qty`, `scale_out_at`
+    3. Update `realized_pnl` for the closed portion
+    4. Move `stop_loss` to `actual_entry_price` (breakeven on the remaining 50%)
+    5. Send confirmation; remaining position continues to full target
+  - [ ] `hold_full` callback: set `scale_out_elected=true`; silences further scale-out
+    prompts for this trade; user rides full position to target or original stop
+  - [ ] Idempotent: pressing `scale_out_half` twice only closes once
+  - [ ] Emit `audit_log` `trade.scale_out` or `trade.hold_full_elected`
 - [ ] Idempotency: Accept twice → exactly one trade (transaction + status check)
 - [ ] Unknown / malformed callback → silent ignore + audit log
 - [ ] **Conversation state** for live execution flow, stored in `DashMap<ChatId, ConversationState>`:
@@ -1293,6 +1406,11 @@ trades immediately — no waiting required.
 - [ ] `/close` computes correct P&L for long and short
 - [ ] `/open` shows only open and planned trades
 - [ ] Malformed UUID → no crash, audit row written
+- [ ] `scale_out_half`: 50% quantity closed, `stop_loss` moved to breakeven, `realized_pnl` updated
+- [ ] `scale_out_half` twice → second press is a no-op (idempotent)
+- [ ] `hold_full`: `scale_out_elected=true` set, no further scale-out prompts for this trade
+- [ ] `SCALE_OUT_ENABLED=false`: no scale-out prompt sent when 1R reached
+- [ ] Short-side trade rejected by risk engine when `ALLOW_SHORT_SIGNALS=false`
 
 ---
 
@@ -1731,13 +1849,15 @@ This is the highest-impact alternative data source. Implement in layers.
 - [ ] Per-trade checks on each tick:
   - [ ] Target hit → `closed_target`, `realized_pnl`, `closed_at`, Telegram alert
   - [ ] Stop hit → `closed_stop`, `realized_pnl`, `closed_at`, Telegram alert
-  - [ ] +1R milestone (price moved 1R in favor) → Telegram alert
-  - [ ] +2R milestone → Telegram alert
+  - [ ] **+1R milestone:** if `SCALE_OUT_ENABLED=true` and `scale_out_elected=false`
+    and no prior scale-out: send the scale-out prompt (buttons wired in M9).
+    If `SCALE_OUT_ENABLED=false`: send a plain info alert "+1R reached"
+  - [ ] +2R milestone → Telegram alert (fires whether or not scale-out was taken)
 - [ ] **Restart-safe:** before each Telegram send, write the alert key to
   `trades.alerts_sent` JSONB; on boot, skip already-sent alerts
-- [ ] Market-hours awareness: env-configurable trading sessions per asset class
-  (`MARKET_HOURS_STOCKS`, `MARKET_HOURS_CRYPTO` = `always`); suppress price checks
-  outside hours and on weekends for non-24h markets
+- [ ] Market-hours awareness: use `ExchangeCalendar` from M3 for session windows per
+  asset class; suppress price checks outside trading hours and on holidays for
+  non-24h markets (crypto polls always)
 - [ ] Provider failure: log error, back off exponentially, do not crash task
 - [ ] Graceful shutdown: monitor task obeys shutdown channel
 
@@ -1745,10 +1865,13 @@ This is the highest-impact alternative data source. Implement in layers.
 
 - [ ] Target hit → `closed_target`, one alert sent
 - [ ] Stop hit → `closed_stop`, one alert sent
-- [ ] +1R / +2R fire exactly once each, even after process restart between them
+- [ ] +1R with `SCALE_OUT_ENABLED=true`: scale-out prompt sent; not re-sent after restart
+- [ ] +1R with `SCALE_OUT_ENABLED=false`: plain "+1R" alert sent once
+- [ ] +1R after `hold_full` elected: no scale-out prompt, no duplicate +1R alert
+- [ ] +2R fires exactly once, even after process restart between +1R and +2R
 - [ ] Closed trades are not polled
 - [ ] Provider error does not kill the task
-- [ ] Outside market hours: no price checks, no alerts
+- [ ] NYSE holiday: no price checks for stock trades, no alerts
 
 ---
 
@@ -1841,8 +1964,23 @@ This is the highest-impact alternative data source. Implement in layers.
   - [ ] Today's signals: accepted / rejected counts
   - [ ] Current market regime
   - [ ] Top-scoring pending signal (if any)
+- [ ] **Benchmark equity curve tracking:**
+  - [ ] On first trade (paper or live), record `benchmark_start_date` and fetch SPY close
+    price at that date; store in a `benchmark` table: `symbol, start_date, start_price,
+    fetched_at` (single row, updated if the bot is reset)
+  - [ ] Weekly summary includes a benchmark comparison line:
+    ```
+    Bot P&L:     +€1,240  (+12.4%)
+    SPY return:            +8.1%  (same period)
+    Alpha:                 +4.3%  ✅
+    ```
+  - [ ] `GET /api/stats` includes `benchmark_return_pct` and `alpha_vs_benchmark`
+  - [ ] Note: all P&L figures are **gross (pre-tax)**. German residents: TR withholds
+    Kapitalertragsteuer (~26.375%) automatically — actual net returns are approximately
+    ×0.74 of reported gross.
 - [ ] Weekly Telegram summary (every Monday morning):
-  - [ ] Closed trades: win rate, average R, realized P&L
+  - [ ] Closed trades: win rate, average R, realized P&L (gross)
+  - [ ] Bot return vs. SPY benchmark return (same period)
   - [ ] Best and worst trade
   - [ ] Strategy performance breakdown
   - [ ] Most-mentioned symbols in social feeds
@@ -1850,13 +1988,16 @@ This is the highest-impact alternative data source. Implement in layers.
   - [ ] `GET /api/signals/recent?limit=50`
   - [ ] `GET /api/trades/open`
   - [ ] `GET /api/trades/history?from=&to=`
-  - [ ] `GET /api/stats` — aggregate win rate, expectancy, P&L
+  - [ ] `GET /api/stats` — aggregate win rate, expectancy, P&L, benchmark comparison
   - [ ] `GET /api/trades/export.csv`
 - [ ] Pagination on all list endpoints (`cursor`-based)
 
 ### Testing
 
 - [ ] Daily and weekly summaries contain correct data
+- [ ] Weekly summary shows bot P&L vs. SPY return vs. alpha for the same period
+- [ ] `GET /api/stats` includes `benchmark_return_pct` and `alpha_vs_benchmark`
+- [ ] Benchmark row created on first trade; not re-created if already exists
 - [ ] Endpoints reject requests without valid admin token (401)
 - [ ] CSV export is parseable and contains all expected columns
 - [ ] Pagination: fetching all pages yields same set as unpaginated (small test set)

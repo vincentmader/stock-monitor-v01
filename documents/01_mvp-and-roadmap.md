@@ -764,6 +764,16 @@ before adding Telegram, risk engine, and deployment infrastructure on top of the
     (EMA stack + ADX > 25) and earnings are 3–7 days away, score a continuation entry.
     The earnings date proximity is surfaced as a risk factor, not a disqualifier. This
     captures pre-earnings run-up, a well-documented seasonal effect.
+  - [ ] `ShortSqueezeStrategy` — **first-class strategy, not just a score modifier.**
+    Setup: high short interest (available from V2-14 when live) + bullish technical
+    structure (price holding above key support, RSI recovering from oversold) + a
+    catalyst (earnings surprise, unusual options call sweep, or news event). The
+    asymmetry: trapped shorts become forced buyers, amplifying the move to 2–5× typical
+    R. In MVP (before short interest data is live), runs in technical-only mode — looks
+    for the TA pattern and flags as "potential squeeze" if volume is surging on an
+    attempted breakdown failure. Lower confidence until short interest data is wired in.
+    A squeeze setup should never be sized at normal risk — cap at 0.5× `RISK_PER_TRADE_PCT`
+    due to the binary outcome risk if the squeeze fails.
 - [ ] **Earnings proximity modifier applied to all strategies:**
   - [ ] Earnings within 0–2 days: add `"⚠️ Earnings in N days — gap risk"` to
     `SignalContext.risk_factors`; reduce composite score by 15 points (except
@@ -989,7 +999,28 @@ trades immediately — no waiting required.
 - [ ] Currency conversion: for non-`ACCOUNT_CURRENCY` assets, use a fixed exchange rate
   from env (`FX_USD_EUR`, etc.) — live FX in V2
 - [ ] `MAX_DAILY_LOSS_PCT` and `MAX_WEEKLY_LOSS_PCT` env vars: schema and env vars exist
-  in M7; enforcement is V2 (M-V2-11)
+  in M7; enforcement is V2 (M-V2-16)
+- [ ] **Fundamental quality gate** (stocks only — skipped for ETFs, crypto, commodities):
+  - [ ] Fetch quarterly fundamentals via FMP or Alpha Vantage: revenue growth (TTM),
+    gross margin, debt-to-equity ratio
+  - [ ] Cache in `company_fundamentals` table with 24h TTL:
+    ```sql
+    CREATE TABLE company_fundamentals (
+        symbol          TEXT PRIMARY KEY,
+        revenue_growth  NUMERIC,   -- YoY TTM revenue growth as decimal (e.g. -0.12)
+        gross_margin    NUMERIC,   -- e.g. 0.42
+        debt_to_equity  NUMERIC,
+        fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ```
+  - [ ] Reject signal if any of: revenue growth < `FUND_MIN_REVENUE_GROWTH` (env,
+    default −0.15), gross margin < `FUND_MIN_GROSS_MARGIN` (env, default 0.0),
+    debt-to-equity > `FUND_MAX_DE_RATIO` (env, default 5.0)
+  - [ ] `FUNDAMENTAL_GATE_ENABLED` env var (default true); configurable thresholds so
+    users can tune aggressively for growth plays or defensively for blue chips
+  - [ ] `RiskDecision::Reject` with human-readable reason, e.g. `"Fundamental gate:
+    revenue −18% YoY (threshold −15%)"`
+  - [ ] Data unavailable (private company, no filing): skip gate, log warning
 
 ### Testing
 
@@ -1000,6 +1031,10 @@ trades immediately — no waiting required.
 - [ ] Total risk would exceed cap → `Reject`
 - [ ] Zero entry-stop distance → `Reject` with safe error message, no panic
 - [ ] Fractional vs integer rounding is correct
+- [ ] Fundamental gate: revenue growth below threshold → `Reject` with reason
+- [ ] Fundamental gate: ETF / crypto symbol → gate skipped, signal proceeds
+- [ ] Fundamental data unavailable → gate skipped, warning logged, signal proceeds
+- [ ] `FUNDAMENTAL_GATE_ENABLED=false` → all fundamental checks bypassed
 
 ---
 
@@ -1383,6 +1418,21 @@ cannot capture.
 - [ ] Telegram alert on any qualifying insider buy, independent of scanner signal
 - [ ] Emit `audit_log` on every filing ingested
 
+### IV Rank (Implied Volatility Context)
+
+- [ ] Polygon options data (same paid tier as unusual options flow above)
+- [ ] Compute IV rank: `(current_IV − 52w_low_IV) / (52w_high_IV − 52w_low_IV) × 100`
+- [ ] Store in `options_iv` table: `symbol, iv_rank, current_iv, iv_52w_high, iv_52w_low,
+  fetched_at`
+- [ ] **Score modifier:**
+  - High IV rank (> 70) on a breakout signal: options market already pricing in the move
+    — premium is expensive, risk/reward deteriorates; add −4 to score and a risk factor
+    "High IV rank: market already expects a move"
+  - Low IV rank (< 30) with bullish setup: options cheap, move not expected by market
+    — breakout has more room; add +3 to score
+  - IV rank 30–70: neutral, no modifier
+- [ ] IV rank shown in detailed Telegram analysis: "IV rank: 23 (low — options cheap)"
+
 ### Testing
 
 - [ ] OI ratio below threshold: no event, no alert
@@ -1393,10 +1443,127 @@ cannot capture.
 - [ ] Insider buy cluster (≥ 2 within 5 days): stronger modifier applied
 - [ ] Insider sell: −3 modifier, no alert
 - [ ] EDGAR fetch failure: logged, task does not crash
+- [ ] IV rank > 70 on breakout: −4 modifier, risk factor added to SignalContext
+- [ ] IV rank < 30 on bullish setup: +3 modifier
+- [ ] IV rank 30–70: no modifier
 
 ---
 
-## M-V2-03 — Economic Calendar Integration
+## M-V2-03 — Cross-Sectional Momentum + Sector Rotation
+
+> **New milestone.** Entirely absent from the original plan and high impact-to-effort.
+> A stock breaking out while its sector is breaking down is a much weaker signal than
+> one leading a sector breakout. Cross-sectional ranking is a computation over data
+> you already have — no new APIs required.
+
+### Todos
+
+- [ ] **Sector assignment:** add `sector` (GICS sector) and `industry` columns to
+  `watchlist` table; seed from FMP or a static CSV; ETFs tagged by benchmark sector
+- [ ] Sector ETFs added automatically as non-tradeable watchlist anchors (`enabled=false`):
+  XLK (tech), XLF (financials), XLE (energy), XLV (health), XLP (consumer staples),
+  XLY (consumer discretionary), XLI (industrials), XLB (materials), XLRE (real estate),
+  XLU (utilities), XLC (communication)
+- [ ] **Relative strength computation:**
+  - [ ] `relative_strength(symbol_candles, benchmark_candles, period)` → `Decimal`
+    — rate of change of symbol minus rate of change of benchmark over `period` bars
+  - [ ] Run weekly for all watchlist symbols; benchmark = SPY for stocks/ETFs, QQQ for
+    tech-heavy names (configurable per symbol via `watchlist.benchmark`)
+  - [ ] Store results in `relative_strength` table:
+    ```sql
+    CREATE TABLE relative_strength (
+        symbol              TEXT NOT NULL,
+        period_days         INTEGER NOT NULL,
+        rs_score            NUMERIC NOT NULL,
+        rank_in_sector      NUMERIC NOT NULL,   -- percentile 0–100
+        rank_in_watchlist   NUMERIC NOT NULL,
+        computed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (symbol, period_days, computed_at)
+    );
+    ```
+- [ ] **Sector momentum filter:**
+  - [ ] Long signal passes sector filter if: sector ETF is above its 20-day EMA AND
+    `rank_in_sector` ≥ `SECTOR_RANK_MIN_LONG` (env, default 50th percentile)
+  - [ ] Short signal passes if: sector ETF is below its 20-day EMA AND
+    `rank_in_sector` ≤ `SECTOR_RANK_MAX_SHORT` (env, default 50th percentile)
+  - [ ] `SECTOR_FILTER_ENABLED` env var (default true)
+- [ ] **Cross-sectional score modifier:**
+  - Top quartile (rank ≥ 75) → +5 composite score
+  - Bottom quartile (rank ≤ 25) → −8 composite score
+  - Sector ETF in downtrend and signal is long → −5 additional
+- [ ] Sector context shown in Telegram notification: `"Sector rank 3/12 ✅"` or
+  `"⚠️ Sector trending down"`
+- [ ] **Weekly RS digest** (every Monday): top-3 and bottom-3 symbols by relative
+  strength per sector; helps user spot sector rotation opportunities manually
+
+### Testing
+
+- [ ] RS computation correct against known benchmark candle sequence
+- [ ] Top-quartile rank → +5 modifier applied; bottom-quartile → −8 modifier
+- [ ] Sector ETF below 20 EMA: long signal suppressed (score below threshold)
+- [ ] `SECTOR_FILTER_ENABLED=false`: filter bypassed, modifiers still applied
+- [ ] Weekly digest contains correct ranking for each sector
+- [ ] Symbol with no sector tag: no crash, sector modifier skipped
+
+---
+
+## M-V2-04 — Strategy Performance Feedback Loop
+
+> **New milestone.** Fixed scoring weights are calibrated once at design time and never
+> updated. A strategy that has been wrong five times running in the current regime should
+> have its contribution reduced automatically. This is the feedback loop that turns the
+> bot from a static ruleset into an adaptive system — without requiring ML.
+
+### Todos
+
+- [ ] `strategy_performance` table:
+  ```sql
+  CREATE TABLE strategy_performance (
+      strategy        TEXT NOT NULL,
+      asset_class     TEXT NOT NULL,
+      window_days     INTEGER NOT NULL,   -- rolling window: 30, 90, 365
+      trade_count     INTEGER NOT NULL,
+      win_rate        NUMERIC NOT NULL,
+      avg_r           NUMERIC NOT NULL,
+      expectancy      NUMERIC NOT NULL,
+      suspended       BOOLEAN NOT NULL DEFAULT false,
+      last_updated    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (strategy, asset_class, window_days)
+  );
+  ```
+- [ ] Updated on every trade close (paper or live); back-filled from existing `trades`
+  table on startup
+- [ ] **Dynamic score multiplier** (`DYNAMIC_WEIGHTING_ENABLED` env var, default false
+  — enable after accumulating ≥ 30 trades):
+  - 30-day expectancy ≥ 0.5R → multiplier 1.2
+  - 30-day expectancy 0.0–0.5R → multiplier 1.0
+  - 30-day expectancy −0.2–0.0R → multiplier 0.8
+  - 30-day expectancy < −0.2R → multiplier 0.5
+  - Fall back to 90-day window if < 10 trades in 30-day; fall back to 1.0 if < 5 trades
+    in any window
+- [ ] Multiplier applied to strategy's score contribution before final composite score
+- [ ] **Automatic suspension:** if 30-day expectancy < −0.5R with ≥ 15 trades →
+  suspend strategy; send Telegram alert: `"⚠️ EMA Pullback suspended: 30d expectancy
+  −0.7R (15 trades). Use /strategy_resume ema_pullback to re-enable."`
+  - `suspended=true` in `strategy_performance`; scanner skips suspended strategies
+  - `/strategies` Telegram command: list all strategies with trade count, 30d expectancy,
+    multiplier, suspended flag
+  - `/strategy_resume <name>` — re-enable a suspended strategy (requires manual decision)
+- [ ] Emit `audit_log` on multiplier change and suspension
+
+### Testing
+
+- [ ] Expectancy ≥ 0.5R → multiplier 1.2 applied to score contribution
+- [ ] Expectancy < −0.2R → multiplier 0.5 applied
+- [ ] Expectancy < −0.5R with ≥ 15 trades → suspended, Telegram alert sent
+- [ ] < 5 trades in any window → multiplier defaults to 1.0
+- [ ] Suspended strategy not run by scanner
+- [ ] `DYNAMIC_WEIGHTING_ENABLED=false` → multiplier always 1.0, no suspension
+- [ ] `/strategies` output reflects per-strategy metrics and suspended flag
+
+---
+
+## M-V2-05 — Economic Calendar Integration
 
 ### Todos
 
@@ -1420,7 +1587,7 @@ cannot capture.
 
 ---
 
-## M-V2-04 — Social Media Signal Ingestion
+## M-V2-06 — Social Media Signal Ingestion
 
 This is the highest-impact alternative data source. Implement in layers.
 
@@ -1465,7 +1632,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-05 — LLM-Enhanced Analysis
+## M-V2-07 — LLM-Enhanced Analysis
 
 > **Elevated from original V2-14.** Once news (V2-01) and social (V2-04) data are live,
 > Claude can synthesise technical state + news headlines + social sentiment into a verdict
@@ -1509,7 +1676,53 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-06 — Open Trade Monitor (with restart-safe alert state)
+## M-V2-08 — Dark Pool / Block Trade Monitoring
+
+> FINRA publishes Alternative Trading System (ATS) volume data weekly — free, no API
+> key required. Large institutional block prints on dark pools often precede moves by
+> 3–5 days at swing timeframes. This is legally public information that retail can
+> actually access and systematically track.
+
+### Todos
+
+- [ ] FINRA ATS data downloader: fetch the weekly CSV report from the FINRA website
+  (released each Monday, covers the prior week)
+- [ ] Background task: schedule weekly download and parse on Monday after market open
+- [ ] `dark_pool_activity` table:
+  ```sql
+  CREATE TABLE dark_pool_activity (
+      symbol          TEXT NOT NULL,
+      week_ending     DATE NOT NULL,
+      ats_volume      BIGINT NOT NULL,
+      total_volume    BIGINT NOT NULL,
+      ats_pct         NUMERIC NOT NULL,   -- dark pool % of total volume
+      ats_pct_4w_avg  NUMERIC,            -- rolling 4-week average
+      fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (symbol, week_ending)
+  );
+  ```
+- [ ] Spike detection: `ats_pct > ats_pct_4w_avg × DARK_POOL_SPIKE_RATIO` (env,
+  default 1.5) → flag as unusual institutional activity
+- [ ] Score modifier (direction-neutral — dark pool signals institutional attention,
+  not direction):
+  - Spike + bullish TA signal → +5 composite score
+  - Spike + short TA signal → +5 for the short (institutions positioning bearish)
+  - No spike → no modifier
+- [ ] Telegram alert on dark pool spike for any watchlist symbol, independent of scanner
+- [ ] Dark pool context shown in Telegram notification when spike present:
+  `"Dark pool: 31% vs 4w avg 18% — unusual institutional volume"`
+
+### Testing
+
+- [ ] Weekly CSV parsed correctly; `ats_pct` and `ats_pct_4w_avg` computed correctly
+- [ ] Spike fires at correct threshold; no spike below threshold
+- [ ] Score modifier applied for bullish and bearish setups
+- [ ] Weekly import is idempotent (upsert on PRIMARY KEY)
+- [ ] Download failure: logged, last week's data retained, no crash
+
+---
+
+## M-V2-09 — Open Trade Monitor (with restart-safe alert state)
 
 ### Todos
 
@@ -1539,7 +1752,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-07 — Polymarket Integration
+## M-V2-10 — Polymarket Integration
 
 ### Todos
 
@@ -1563,7 +1776,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-08 — Backtesting Enhancements (post-MVP additions)
+## M-V2-11 — Backtesting Enhancements (post-MVP additions)
 
 > The core backtesting engine and validation gate are built in **M6.5** (MVP).
 > This post-MVP milestone adds enhancements that become meaningful once real live
@@ -1592,7 +1805,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-09 — Market Regime Detection
+## M-V2-12 — Market Regime Detection
 
 ### Todos
 
@@ -1619,7 +1832,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-10 — Reporting + Analytics
+## M-V2-13 — Reporting + Analytics
 
 ### Todos
 
@@ -1650,7 +1863,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-11 — Short Interest + Analyst Ratings
+## M-V2-14 — Short Interest + Analyst Ratings
 
 > Options flow and insider activity were elevated to V2-02. This milestone covers the
 > remaining institutional signal sources.
@@ -1682,7 +1895,7 @@ This is the highest-impact alternative data source. Implement in layers.
 
 ---
 
-## M-V2-12 — Chart Pattern Detection
+## M-V2-15 — Chart Pattern Detection
 
 Chart patterns require more candles and are less reliable on short timeframes.
 Implement as an add-on scorer, not a gate.
@@ -1707,7 +1920,7 @@ Implement as an add-on scorer, not a gate.
 
 ---
 
-## M-V2-13 — Advanced Risk Management
+## M-V2-16 — Advanced Risk Management
 
 ### Todos
 
@@ -1737,7 +1950,7 @@ Implement as an add-on scorer, not a gate.
 
 ---
 
-## M-V2-14 — Multi-Strategy Framework
+## M-V2-17 — Multi-Strategy Framework
 
 ### Todos
 
@@ -1763,7 +1976,47 @@ Implement as an add-on scorer, not a gate.
 
 ---
 
-## M-V2-15 — Security Hardening
+## M-V2-18 — ML-Enhanced Signal Weighting
+
+> **Data dependency: requires ≥ 12 months of paper or live trade data.**
+> This is deliberately late — not because it's unimportant, but because training on
+> < 200 trades produces a model that fits noise. Build it once you have the data.
+> The feedback loop in V2-04 bridges the gap: adaptive multipliers without ML,
+> using real outcome data, starting from month 1.
+
+### Todos
+
+- [ ] Feature extraction pipeline: for each historical signal in `signals` table,
+  compute feature vector: `(score_breakdown fields, sector_rank, iv_rank,
+  dark_pool_spike, news_sentiment_24h, social_buzz_4h, asset_class, market_regime,
+  day_of_week, days_to_earnings)`
+- [ ] Outcome label: `reached_target` boolean — price hit `take_profit` before `stop_loss`
+  (computed from `trades` table or from candle history for signals that were rejected)
+- [ ] Train a gradient-boosted classifier (logistic regression as baseline):
+  `features → P(reach_target)` as the signal score (0–100)
+- [ ] **A/B shadow mode:** `ML_SCORING_MODE=shadow` runs both old and new scorer in
+  parallel; logs disagreements to `audit_log` tagged `ml.shadow_disagreement`; only
+  old score used for actual notifications
+- [ ] **Live mode:** `ML_SCORING_MODE=live` — ML confidence score replaces the hand-tuned
+  composite score. Requires ≥ 500 OOS trades and validation accuracy ≥ 55%.
+- [ ] Retrain weekly on rolling 12-month window; store model version + validation metrics
+  in `ml_model_runs` table
+- [ ] Alert if validation accuracy on most recent fold drops below 52% (near-random):
+  `"⚠️ ML model accuracy degraded to 51.2% — reverting to static scoring"`
+- [ ] `ML_SCORING_ENABLED` env var (default false)
+
+### Testing
+
+- [ ] Feature vector shape is deterministic for known signal input
+- [ ] Shadow mode: both scores computed, disagreements logged, only old score governs
+  notifications
+- [ ] Accuracy below 52% threshold → alert fires, model not promoted to live
+- [ ] Retraining on 500-trade synthetic dataset completes without error
+- [ ] `ML_SCORING_ENABLED=false` → no model inference, static scoring used
+
+---
+
+## M-V2-19 — Security Hardening
 
 ### Todos
 
@@ -1787,7 +2040,7 @@ Implement as an add-on scorer, not a gate.
 
 ---
 
-## M-V2-16 — TradingView Webhook (Optional Bonus Input)
+## M-V2-20 — TradingView Webhook (Optional Bonus Input)
 
 TradingView can complement the bot's own scanner as a second opinion.
 
@@ -1811,7 +2064,7 @@ TradingView can complement the bot's own scanner as a second opinion.
 
 ---
 
-## M-V2-17 — Polish + Admin Dashboard
+## M-V2-21 — Polish + Admin Dashboard
 
 ### Todos
 
@@ -1830,38 +2083,42 @@ TradingView can complement the bot's own scanner as a second opinion.
 
 ```
 MVP:
-  M1  (skeleton)
-  → M2  (DB + migrations, incl. backtest + earnings calendar tables)
-  → M3  (market data provider)
-  → M4  (candle ingest — back-fills 3 years of history on first boot)
-  → M5  (TA engine — pure functions, no I/O)
-  → M5.5 (**early backtest validation — go/no-go gate before building further**)
-  → M6  (multi-timeframe scanner + event-driven strategies + earnings calendar)
-  → M6.5 (full backtesting & validation gate ← live_manual locked until this passes)
-  → M7  (risk engine)
-  → M8  (Telegram notification + paper mode)
-  → M9  (Telegram callbacks + trade execution)
-  → M10 (production deploy)
-  → MVP DONE
+  M1   (skeleton)
+  → M2   (DB + migrations, incl. backtest + earnings calendar tables)
+  → M3   (market data provider)
+  → M4   (candle ingest — back-fills 3 years of history on first boot)
+  → M5   (TA engine — pure functions, no I/O)
+  → M5.5 (early backtest validation — go/no-go gate; stop here if no edge)
+  → M6   (scanner + event-driven strategies: EarningsGap, PreEarnings, ShortSqueeze)
+  → M6.5 (full backtesting gate ← live_manual locked until this passes)
+  → M7   (risk engine + fundamental quality gate)
+  → M8   (Telegram notification + paper mode)
+  → M9   (Telegram callbacks + trade execution)
+  → M10  (production deploy)
+  → MVP DONE → paper trade ≥ 3 months before enabling live_manual
 
-V2 (priority-ordered — highest-alpha sources first):
-  M-V2-01 (news sentiment — feeds LLM context + standalone score)
-  → M-V2-02 (options flow + insider activity ← elevated; highest non-TA alpha)
-  → M-V2-03 (economic calendar)
-  → M-V2-04 (social media signals — Reddit, StockTwits, Twitter/X)
-  → M-V2-05 (LLM-enhanced analysis ← elevated; synthesises all V2-01–04 data)
-  → M-V2-06 (open trade monitor)
-  → M-V2-07 (Polymarket integration)
-  → M-V2-08 (backtesting enhancements: survivorship bias, live divergence tracking)
-  → M-V2-09 (market regime detection)
-  → M-V2-10 (reporting + analytics)
-  → M-V2-11 (short interest + analyst ratings)
-  → M-V2-12 (chart pattern detection)
-  → M-V2-13 (advanced risk management)
-  → M-V2-14 (multi-strategy framework)
-  → M-V2-15 (security hardening)
-  → M-V2-16 (TradingView webhook — optional bonus input)
-  → M-V2-17 (polish + admin dashboard)
+V2 (priority-ordered — feedback loops and structural alpha first, then data enrichment):
+  M-V2-01 (news sentiment — pre-filters bad-news trades, feeds LLM)
+  → M-V2-02 (options flow + insider activity + IV rank ← leading indicators, high signal)
+  → M-V2-03 (cross-sectional momentum + sector rotation ← new; computes over data you have)
+  → M-V2-04 (strategy feedback loop ← new; dynamic weight suppression from live outcomes)
+  → M-V2-05 (economic calendar)
+  → M-V2-06 (social media signals — Reddit, StockTwits, Twitter/X)
+  → M-V2-07 (LLM-enhanced analysis — synthesises all V2-01–06 data)
+  → M-V2-08 (dark pool / FINRA ATS monitoring ← new; free, directionally useful)
+  → M-V2-09 (open trade monitor)
+  → M-V2-10 (Polymarket integration)
+  → M-V2-11 (backtesting enhancements: survivorship bias, live divergence tracking)
+  → M-V2-12 (market regime detection)
+  → M-V2-13 (reporting + analytics)
+  → M-V2-14 (short interest + analyst ratings)
+  → M-V2-15 (chart pattern detection)
+  → M-V2-16 (advanced risk management: daily loss caps, Kelly sizing, correlation)
+  → M-V2-17 (multi-strategy framework: TOML-configured strategies, hot-reload)
+  → M-V2-18 (ML-enhanced signal weighting ← new; requires ≥ 12 months data)
+  → M-V2-19 (security hardening)
+  → M-V2-20 (TradingView webhook — optional bonus input)
+  → M-V2-21 (polish + admin dashboard)
 ```
 
 After every MVP milestone: commit, run the full testing checklist, deploy to the

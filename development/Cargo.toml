@@ -1,0 +1,67 @@
+[package]
+name = "swingbot"
+version = "0.1.0"
+edition = "2021"
+description = "Autonomous multi-asset trading intelligence system"
+
+[[bin]]
+name = "swingbot"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum            = { version = "0.7", features = ["macros"] }
+tower           = { version = "0.4", features = ["full"] }
+tower-http      = { version = "0.5", features = ["trace", "request-id", "limit", "cors"] }
+tower_governor  = { version = "0.4", features = ["axum"] }
+
+# Async runtime
+tokio      = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio-rustls", "postgres",
+    "rust_decimal", "uuid", "chrono", "macros",
+] }
+
+# Telegram
+teloxide = { version = "0.13", default-features = false, features = [
+    "ctrlc_handler", "webhooks-axum", "macros",
+] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialisation
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Precision arithmetic — never f64 for prices
+rust_decimal        = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# IDs / time
+uuid   = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"
+
+# Error handling
+anyhow    = "1"
+thiserror = "1"
+
+# Structured logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+dotenvy = "0.15"
+
+# In-memory concurrent state
+dashmap = "6"
+
+# Async trait support (needed for object-safe async traits)
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
